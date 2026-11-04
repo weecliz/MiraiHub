@@ -126,6 +126,17 @@ SENSITIVE_TERMS: list[str] = [
     "noreply@anthropic.com",
 ]
 
+# Claude Code 把计费元数据当纯文本塞进 system 首块：
+#   "x-anthropic-billing-header: cc_version=2.1.310.8ea; cc_entrypoint=sdk-cli;"
+# 它**不是**协议字段（真正的 HTTP 头在 backend 里），上游只拿它做「是否官方
+# 客户端」的渠道识别。零宽对它无效 —— 上游会归一化零宽后再比对（实测；
+# upstream_compat 里同一个结论），所以这里删除整行。
+# 与 upstream_compat.strip_harness_billing_header 的匹配口径保持一致；
+# 本模块保持独立可导入，因此不 import 那边，各留一份正则。
+_BILLING_LINE_RE = re.compile(r"(?im)^[ \t]*x-anthropic-billing-header[ \t]*:[^\n]*(?:\n|$)")
+# 行中出现时只删到分号为止，避免吞掉同一行后面真正的内容。
+_BILLING_INLINE_RE = re.compile(r"(?i)x-anthropic-billing-header[ \t]*:[^;\n]*;?")
+
 # 编译成一个大正则，按词长降序，避免短词先吃掉长词。
 # 用 \b 边界 + 忽略大小写。
 _PATTERN = re.compile(
@@ -311,7 +322,13 @@ def _zero_width_split(term: str) -> str:
 
 
 def desensitize_text(text: str) -> str:
-    """对文本中的触发词插入零宽空格。无触发词则原样返回。"""
+    """删除计费指纹行，再对触发词插入零宽空格。无改动则原样返回。"""
+    if not text:
+        return text
+    if _BILLING_LINE_RE.search(text):
+        text = _BILLING_LINE_RE.sub("", text)
+    if _BILLING_INLINE_RE.search(text):
+        text = _BILLING_INLINE_RE.sub("", text)
     if not text:
         return text
     return _PATTERN.sub(lambda m: _zero_width_split(m.group(0)), text)
@@ -538,11 +555,16 @@ def desensitize_messages(messages: Iterable[dict],
                 new_blocks = []
                 for index, blk in enumerate(content):
                     if isinstance(blk, dict) and blk.get("type") == "text":
+                        before = blk.get("text", "")
                         nb = dict(blk)
                         nb["text"] = '\n\n'.join([
-                            desensitize_text(_prune_runtime_fragments(role, blk.get("text", ""))),
+                            desensitize_text(_prune_runtime_fragments(role, before)),
                             *block_instructions.get(index, []),
                         ])
+                        # 原文非空、处理后为空 = 整块只有指纹行；不留空 text 块
+                        # （部分上游对空 content block 直接 400）。
+                        if before.strip() and not nb["text"].strip():
+                            continue
                         new_blocks.append(nb)
                     else:
                         new_blocks.append(blk)
