@@ -2461,6 +2461,30 @@ def _model_access_error(key, model):
     return _model_out_of_group_error(model)
 
 
+#: 客户端附在模型名尾部的「上下文窗口」标记，例如 Anthropic 的
+#: `claude-sonnet-4[1m]` / `deepseek-v4.1-flash[1M]`。它是**请求参数**而非
+#: 模型身份：上游不认，本地白名单/分组也按裸名配置，不剥离就一律 403。
+_MODEL_CTX_SUFFIX_RE = re.compile(r"\s*\[\s*\d+\s*[kKmM]\s*\]\s*$")
+
+
+def strip_model_context_suffix(model: str) -> str:
+    """去掉模型名尾部的 `[1m]` / `[128k]` 之类上下文标记。
+
+    实测（2026-11-04）：Claude Code 发 `qwen-3.8-max[1M]`，分组里配的是
+    `qwen-3.8-max`，`requested in allowed` 恒为 False → 403 model_not_in_group。
+    剥离后正常命中。
+
+    只动**尾部**方括号，且要求里面是「数字 + k/m」：
+      `model[1m]`    -> `model`
+      `model[128k]`  -> `model`
+      `model[foo]`   -> 原样（不是上下文标记，可能是真实名字）
+    """
+    if not model or "[" not in model:
+        return model
+    stripped = _MODEL_CTX_SUFFIX_RE.sub("", model)
+    return stripped or model
+
+
 def _pick_best_model(db: Session, requested_model: str,
                      allowed: set[str] | None = None) -> str | None:
     """根据请求模型和可用配置，选出最优实际使用的模型 ID。
@@ -2470,9 +2494,15 @@ def _pick_best_model(db: Session, requested_model: str,
       - 用户传 "auto" 或空 → 优先选免费模型（credit_multiplier=0），没有免费的才选付费的
       - 未配置任何模型规则时放行全部（向后兼容），返回原始 model
       - allowed 非 None 时（Key 绑定了分组），只在 allowed 集合内选择
+      - 模型名尾部的上下文标记（`[1m]`/`[128k]`）在判定前剥离
     """
     from admin.routers.models import _is_model_allowed, _get_free_models, _get_enabled_models
     from admin.models import ModelConfig
+
+    # 先剥离 `[1m]` 这类上下文标记，再做任何白名单/分组判定。
+    # 三条入口（/v1/messages、/v1/chat/completions、/v1/responses）都经过
+    # 本函数，放这里即可全覆盖，不必在每个端点里重复。
+    requested_model = strip_model_context_suffix(requested_model)
 
     # 检查是否有任何配置记录（无配置=向后兼容，放行全部）
     has_any_config = db.query(ModelConfig).first() is not None
