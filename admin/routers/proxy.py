@@ -2063,6 +2063,9 @@ def _transient_cool_fallback(db: Session, exclude_ids: set | None,
     # 漏掉这里的话，严格过滤没选到号时会从别的平台拉一个过来 ——
     # 表现就是「WorkBuddy 报 8 个账号不可选」那种跨平台串号。
     q = q.filter(Account.platform == registry.DEFAULT_PLATFORM)
+    # 兜底只放宽 `cool_until`，**不放宽封禁**：被封是上游侧的永久事实，
+    # 不是「等一会就好」的临时限流；兜底选中它只会多一次必败请求。
+    q = q.filter(or_(Account.ban_kind.is_(None), Account.ban_kind == ""))
     q = scope_accounts(q, account_id, key_id, key=key)
     if min_balance > 0:
         q = q.filter(Account.balance_remain > 0)
@@ -2230,6 +2233,15 @@ def _select_account(db: Session, exclude_ids: set | None = None,
     #
     # 多平台各自有 gateway，不走这里，所以固定用默认平台即可。
     q = q.filter(Account.platform == registry.DEFAULT_PLATFORM)
+    # 已被上游封禁的号永不参与选号。
+    #
+    # 为什么不直接置 status='disabled'：那是「我主动停用」的语义，批量
+    # 启用/禁用时会被一并翻开。封禁是上游侧的事实（ban_kind 记着业务码），
+    # 解封后只需清空该字段即可恢复，不必重建账号。
+    #
+    # 代价必须挡住：被封的号每次被选中都会白打一次上游（一次 403 + 换号），
+    # 既增加延迟，也可能加重上游的风控判定。
+    q = q.filter(or_(Account.ban_kind.is_(None), Account.ban_kind == ""))
     q = scope_accounts(q, account_id, key_id, key=key)
     if min_balance > 0:
         q = q.filter(Account.balance_remain > 0)
