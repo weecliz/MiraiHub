@@ -3653,11 +3653,16 @@ async def responses_proxy(
                             converter.finish()
                             obj = converter.get_nonstream_response()
                             cost_info = _parse_usage(r.text)
+                            # 同 /v1/messages 非流式分支：整条响应是在
+                            # `client.post()` 里拿全的，没有单独的流式首字节时刻，
+                            # 按整条耗时补 ttfb，否则用量页速度列是 “—”。
+                            latency_ms = int((time.perf_counter() - request_start) * 1000)
+                            ttfb_ms = latency_ms
                             acc_i.last_used_at = datetime.utcnow()
                             await _blocking_call(_note_success, db2, acc_i)  # 成功清零连败计数
                             updated = sess_i.updated_json()
                             total_toks = cost_info["total_tokens"] or cost_info["completion_tokens"]
-                            seq = _log_chat_row(None, None, m, "resp", acc_i.uid or "-", 200, total_toks, error_kind="success")
+                            seq = _log_chat_row(ttfb_ms, latency_ms, m, "resp", acc_i.uid or "-", 200, total_toks, error_kind="success")
                             sess_i.close()
                             if sticky_key and held_uid:
                                 POOL.sticky.bind(sticky_key, held_uid)
@@ -3670,7 +3675,8 @@ async def responses_proxy(
                                           completion_tokens=cost_info["completion_tokens"],
                                           total_tokens=cost_info["total_tokens"],
                                           cached_tokens=cost_info["cached_tokens"],
-                                          seq=seq, error_kind="success")
+                                          seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms,
+                                          error_kind="success")
                             return JSONResponse(content=obj)
                     except GatewayRejected:
                         raise
@@ -4134,11 +4140,19 @@ async def anthropic_messages(
                                 conv.feed_line(line)
                             msg_obj = conv.build_message()
                             cost_info = _parse_usage("\n".join(raw_lines))
+                            # 非流式同样是「攒完整条 SSE 再一次性回给客户端」，
+                            # 中间并没有真的少了首字节 —— 只是首字节发生在
+                            # `client.post()` 返回之前，没被计时。缺了 ttfb 会让
+                            # 用量页的速度列整列显示 “—”（算不出生成速度）。
+                            # 这里按整条响应耗时补上：语义是「等到第一个可用数据
+                            # 的时间」，对非流式就是全部内容到齐的时刻。
+                            latency_ms = int((time.perf_counter() - request_start) * 1000)
+                            ttfb_ms = latency_ms
                             acc_i.last_used_at = datetime.utcnow()
                             await _blocking_call(_note_success, db2, acc_i)  # 成功清零连败计数
                             updated = sess_i.updated_json()
                             total_toks = cost_info["total_tokens"] or cost_info["completion_tokens"]
-                            seq = _log_chat_row(None, None, m, "anthropic", acc_i.uid or "-", 200,
+                            seq = _log_chat_row(ttfb_ms, latency_ms, m, "anthropic", acc_i.uid or "-", 200,
                                                 total_toks, error_kind="success")
                             sess_i.close()
                             if sticky_key and held_uid:
@@ -4152,7 +4166,8 @@ async def anthropic_messages(
                                           completion_tokens=cost_info["completion_tokens"],
                                           total_tokens=cost_info["total_tokens"],
                                           cached_tokens=cost_info["cached_tokens"],
-                                          seq=seq, error_kind="success")
+                                          seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms,
+                                          error_kind="success")
                             return JSONResponse(content=msg_obj)
                     except GatewayRejected:
                         raise
@@ -4300,9 +4315,14 @@ async def anthropic_messages(
                                     if events:
                                         pending_events.append(events)
                                     if delivered or _sse_has_content(line) or _sse_has_finish_reason(line):
+                                        # 首字节时间按**上游首个有效数据行**记，不能只在
+                                        # `pending_events` 非空时才记：转换器可能对某几行
+                                        # 不产出事件（例如只有 usage / ping 片段），那种
+                                        # 情况下 `ttfb_at` 会一直留空，用量页的速度列就
+                                        # 整列显示 “—”。
+                                        ttfb_at = ttfb_at or time.perf_counter()
                                         if pending_events:
                                             delivered = True
-                                            ttfb_at = ttfb_at or time.perf_counter()
                                             yield "".join(pending_events)
                                             pending_events.clear()
                             # HTTP 200 但体内是错误信封（-32603 / ENOSPC）：
