@@ -2317,6 +2317,9 @@ document.addEventListener("click", event => {
    ========================================================================== */
 
 let _sentinelData = null;
+//: 信号名 -> 中文（后端 `status().signal_labels` 下发，这里缓存一份给
+//: 表格渲染用；后端没给时退化为展示原始 signal 名）。
+let SIGNAL_LABELS_CACHE = {};
 
 async function loadSentinel(force) {
   const summary = $("#sentinelSummary");
@@ -2326,6 +2329,7 @@ async function loadSentinel(force) {
     if (!r.ok) return;
     const data = await r.json();
     _sentinelData = data;
+    SIGNAL_LABELS_CACHE = data.signal_labels || SIGNAL_LABELS_CACHE;
     renderSentinel(data);
     // 侧栏角标：没打开面板也能看到「有账号正在被风控」
     const n = data.accounts_affected || 0;
@@ -2382,21 +2386,27 @@ function renderSentinel(data) {
     </div>`;
 
   // 账号表：谁处于什么阶段
+  //
+  // **必须带平台列**：以前只写 `#152`，同屏出现 5 个号时根本看不出
+  // 是哪个平台的（一个号池里 workbuddy / trae / loomy 的 id 会混排）。
   const accounts = data.accounts || [];
+  const sevChip = sentinelSeverityChip;
   $("#sentinelAccounts").innerHTML = `
     <div class="sentinel-card-head"><h3>受影响账号</h3>
-      <span>按最近一次信号排序</span></div>
+      <span>按最近一次信号排序 · ${accounts.length} 个账号有信号</span></div>
     ${accounts.length ? `<div class="sentinel-table-wrap"><table class="tbl">
-      <thead><tr><th>账号</th><th>最近信号</th><th>次数</th><th>首次</th><th>最近</th></tr></thead>
+      <thead><tr><th>平台</th><th>账号</th><th>最近信号</th><th>类型</th><th>次数</th><th>首次</th><th>最近</th></tr></thead>
       <tbody>${accounts.map(item => `<tr>
+        <td>${sentinelPlatformChip(item.platform)}</td>
         <td class="sentinel-acc">#${item.account_id}</td>
         <td><span class="sentinel-code">${esc(item.code || item.kind || "-")}</span>
           ${esc(item.label || "")}</td>
+        <td>${sevChip(item.severity, item.signal)}</td>
         <td class="tnum">${item.count}</td>
         <td class="sentinel-ts">${fmtTime(new Date((item.first_ts || 0) * 1000).toISOString().slice(0, 19))}</td>
         <td class="sentinel-ts">${fmtTime(new Date((item.last_ts || 0) * 1000).toISOString().slice(0, 19))}</td>
       </tr>`).join("")}</tbody></table></div>`
-    : `<p class="sentinel-empty">最近没有账号被上游风控。</p>`}`;
+    : `<p class="sentinel-empty">最近没有账号被上游拦。</p>`}`;
 
   // 原始事件流：排障时能定位到具体某次请求
   const events = data.recent || [];
@@ -2404,16 +2414,59 @@ function renderSentinel(data) {
     <div class="sentinel-card-head"><h3>信号明细</h3>
       <span>最近 ${events.length} 条（Redis 保留 15 分钟，自动过期）</span></div>
     ${events.length ? `<div class="sentinel-table-wrap"><table class="tbl">
-      <thead><tr><th>时间</th><th>账号</th><th>类型</th><th>码</th><th>模型</th><th>细节</th></tr></thead>
+      <thead><tr><th>时间</th><th>平台</th><th>账号</th><th>类型</th><th>码</th><th>模型</th><th>细节</th></tr></thead>
       <tbody>${events.map(ev => `<tr>
         <td class="sentinel-ts">${fmtTime(new Date((ev.ts || 0) * 1000).toISOString().slice(0, 19))}</td>
+        <td>${sentinelPlatformChip(ev.platform)}</td>
         <td class="sentinel-acc">#${ev.account_id}</td>
-        <td>${esc(ev.kind || "")}</td>
-        <td><span class="sentinel-code">${esc(ev.code || "-")}</span></td>
+        <td>${sevChip(ev.severity, ev.signal)}</td>
+        <td><span class="sentinel-code ${ev.unmapped ? "is-unmapped" : ""}"
+              ${ev.unmapped ? `data-tooltip="未收录的码" data-tooltip-description="该平台的这个码还没进 sentinel.PLATFORM_SIGNALS，显示为未归类；补一行映射即可。"` : ""}>${esc(ev.code || "-")}</span></td>
         <td class="sentinel-model">${esc(ev.model || "-")}</td>
         <td class="sentinel-detail" data-tooltip="${esc(ev.detail ||"")}">${esc((ev.detail || "").slice(0, 90))}</td>
       </tr>`).join("")}</tbody></table></div>`
     : `<p class="sentinel-empty">暂无明细。</p>`}`;
+}
+
+/**
+ * 平台小标签（复用 `usage-platform-chip` 的形制）。
+ *
+ * 平台名来自事件的 `platform`（落库名），用 `_logPlatformLabels` 换成展示名；
+ * 拿不到就原样显示 —— 宁可显示 `minimax` 也不能显示空白。
+ */
+function sentinelPlatformChip(platform) {
+  const key = String(platform || "").toLowerCase();
+  if (!key) return `<span class="sentinel-plat is-empty">未知平台</span>`;
+  const label = (_logPlatformLabels && _logPlatformLabels[key]) || key;
+  return `<span class="sentinel-plat" data-tooltip="${esc(label)}"
+    data-tooltip-description="该信号来自 ${esc(key)} 平台的上游返回。">${esc(label)}</span>`;
+}
+
+/**
+ * 信号类型小标签。
+ *
+ * 四档语义（见 `admin/sentinel.py`）：
+ *   risk      真封控 —— 计入熔断
+ *   throttle  限速 / 限流 / 排队 / 额度耗尽 —— 只记录
+ *   auth      登录失效 / 退出登录 —— 只记录，需要重新登录
+ *   info      其它留痕
+ */
+const SENTINEL_SEVERITY_META = {
+  risk:     { label: "风控", cls: "is-risk",     hint: "上游在拦（WAF / 渠道 / 账号级风控 / 签名）。会计入批次熔断判定。" },
+  throttle: { label: "限流", cls: "is-throttle", hint: "限速 / 限流 / 排队 / 额度耗尽。属于运营态，只记录、不熔断。" },
+  auth:     { label: "登录", cls: "is-auth",     hint: "登录态失效 / 退出登录。不算风控，需要重新登录；只记录。" },
+  info:     { label: "记录", cls: "is-info",     hint: "留痕用，没有止损动作。" },
+};
+function sentinelSeverityChip(severity, signal) {
+  const key = String(severity || "info");
+  const meta = SENTINEL_SEVERITY_META[key] || SENTINEL_SEVERITY_META.info;
+  const name = (SIGNAL_LABELS_CACHE[String(signal || "")])
+    || (_sentinelData && _sentinelData.signal_labels
+        && _sentinelData.signal_labels[String(signal || "")])
+    || String(signal || "");
+  return `<span class="sentinel-sev ${meta.cls}" data-tooltip="${esc(meta.label)}${
+    name ? " · " + esc(name) : ""}" data-tooltip-description="${esc(meta.hint)}">${
+    esc(meta.label)}${name ? `<em>${esc(name)}</em>` : ""}</span>`;
 }
 
 async function sentinelPause(platform) {
@@ -3111,13 +3164,45 @@ function statCard(label, value, opts) {
   opts = opts || {};
   const cls = opts.tone ? ` is-${opts.tone}` : "";
   const icon = opts.icon ? ic(opts.icon, opts.iconColor || "") : "";
+  // `chips`：把"一堆用 · 串起来的数字"改成小胶囊 ——
+  // 模型使用统计的四张卡原来靠 `共 162 个 · 日耗尽 0 · 限流 0 · 冷却 1 · 停用 34`
+  // 这种长句说明，11px 挤成一团，扫读成本很高。胶囊化之后每个数字都能被
+  // 单独看见，也为将来"点胶囊下钻"留好了结构。
+  const chips = Array.isArray(opts.chips) && opts.chips.length
+    ? `<div class="stat-chips">${opts.chips.map(chip => {
+        const tone = chip.tone ? ` is-${chip.tone}` : "";
+        const zero = Number(chip.value) === 0 ? " is-zero" : "";
+        const shown = Number.isFinite(Number(chip.value))
+          ? Number(chip.value).toLocaleString("zh-CN")
+          : (chip.value ?? "—");
+        return `<span class="stat-chip${tone}${zero}"${chip.title
+            ? ` data-tooltip="${esc(chip.title)}"` : ""}>${esc(chip.label || "")}<b>${shown}</b></span>`;
+      }).join("")}</div>`
+    : "";
   const sub = opts.sub ? `<div class="stat-sub">${opts.sub}</div>` : "";
   // 数值统一过一遍千分位：同一个「11351」在概览是 11,351、在账号池是 11351，
   // 是 issue #4 里最扎眼的一处不一致。字符串（如「会话鉴权」）原样输出。
   const shown = opts.raw ? value : fmtAuto(value);
   return `<div class="stat${cls}">
     <div class="stat-label">${icon}${esc(label)}</div>
-    <div class="stat-value">${shown}</div>${sub}</div>`;
+    <div class="stat-value">${shown}</div>${chips}${sub}</div>`;
+}
+
+/**
+ * 「共 / 成功 / 错误」这类**纯数值**渲染成小胶囊。
+ *
+ * 原来是一行 `当前筛选 · 共 1234 次 · 成功 1200 次 · 错误 34 次` 的纯文本：
+ * 数字和文字同字号同颜色，扫一眼分不出哪个是重点，错误数混在中间根本看不见。
+ * 现在数字加粗、按语义描边（错误为红），与 `usage-platform-chip` 同一形制。
+ */
+function logStatChips(items) {
+  const parts = (items || []).map(item => {
+    const value = Number(item.value);
+    const shown = Number.isFinite(value) ? value.toLocaleString("zh-CN") : (item.value ?? "—");
+    return `<span class="logstat ${item.tone || ""}">
+      <em>${esc(item.label)}</em><b>${shown}</b></span>`;
+  });
+  return `<span class="logstat-row">${parts.join("")}</span>`;
 }
 
 /** 统计卡的默认数值格式：整数千分位，小数最多两位，非数字原样返回。 */
@@ -3995,6 +4080,112 @@ function accSelectedIds() {
 
 function accPickAllToggle(master) {
   document.querySelectorAll("#accBody .acc-pick").forEach(b => { b.checked = !!master.checked; });
+  accBulkSync();
+}
+
+/* ==========================================================================
+   账号池批量操作（勾选后出现操作条，全平台生效）
+   --------------------------------------------------------------------------
+   用户反馈：「账号池支持勾选，但勾上之后没有任何批量入口，想停用 20 个号
+   只能一个个点」。
+
+   这里只做**入口与交互**，真正的动作在 `POST /api/accounts/bulk`。
+   关键约定：
+     · 选择状态由 `#accBody .acc-pick` 决定，**跨平台允许**（不按当前平台过滤）；
+     · 操作条固定显示在表格上方，选中数实时更新；
+     · 危险动作（删除）必须二次确认，并说明「不可恢复」；
+     · 完成后刷新列表并清空选择，避免"删完还显示选中 N 个"。
+   ========================================================================== */
+
+const ACC_BULK_LABELS = {
+  enable: "批量启用", disable: "批量禁用", delete: "批量删除",
+  refresh: "批量刷新额度", check: "批量检测",
+};
+
+/** 同步操作条的显示与计数（勾选变化时调用）。 */
+function accBulkSync() {
+  const bar = document.getElementById("accBulkBar");
+  const count = document.getElementById("accBulkCount");
+  if (!bar) return;
+  const ids = accSelectedIds();
+  if (count) count.textContent = String(ids.length);
+  bar.hidden = ids.length === 0;
+  // 表头全选框跟随当前页状态（半选用 indeterminate）
+  const master = document.getElementById("accPickAll");
+  if (master) {
+    const boxes = [...document.querySelectorAll("#accBody .acc-pick")];
+    const checked = boxes.filter(b => b.checked).length;
+    master.checked = boxes.length > 0 && checked === boxes.length;
+    master.indeterminate = checked > 0 && checked < boxes.length;
+  }
+}
+
+function accBulkClear() {
+  document.querySelectorAll("#accBody .acc-pick").forEach(b => { b.checked = false; });
+  const master = document.getElementById("accPickAll");
+  if (master) { master.checked = false; master.indeterminate = false; }
+  accBulkSync();
+}
+
+/** 执行一次批量动作。 */
+async function accBulkRun(action) {
+  const ids = accSelectedIds();
+  if (!ids.length) { toast("先勾选账号", "err"); return; }
+  const label = ACC_BULK_LABELS[action] || action;
+  const danger = action === "delete";
+  const yes = await uiConfirm({
+    kind: danger ? "warn" : "info",
+    danger,
+    title: label,
+    message: danger
+      ? `确认删除 ${ids.length} 个账号？\n删除**不可恢复**（凭证、绑定、余额快照一并消失）。\n被 API Key 独占绑定的账号删除后，该 Key 会失去专属账号。`
+      : `对选中的 ${ids.length} 个账号执行「${label}」？\n动作对全部平台生效，不受当前平台筛选限制。`,
+    okText: label,
+  });
+  if (!yes) return;
+
+  const btn = event && event.target ? event.target.closest("button") : null;
+  const restore = btn ? btnBusy(btn, "执行中") : () => {};
+  try {
+    const r = await api("/api/accounts/bulk", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, ids }),
+    });
+    const { ok, data } = await safeJson(r);
+    if (!ok) throw new Error((data && data.detail) || ("HTTP " + r.status));
+    const parts = [`${label}：影响 ${data.affected} 个`];
+    if (data.skipped && data.skipped.length) parts.push(`跳过 ${data.skipped.length} 条`);
+    if (data.errors && data.errors.length) parts.push(`失败 ${data.errors.length} 条`);
+    toast(parts.join(" · ") + (data.note ? " · " + data.note : ""),
+          (data.errors && data.errors.length) ? "err" : "ok");
+    if (data.errors && data.errors.length) console.warn("[acc-bulk] 失败明细", data.errors);
+    accBulkClear();
+    accReloadActive();
+  } catch (error) {
+    toast(label + "失败：" + (error && error.message ? error.message : error), "err");
+  } finally {
+    restore();
+  }
+}
+
+/** 导出勾选的账号（走已有的导出流程，只带选中的 id）。 */
+async function accBulkExport() {
+  const ids = accSelectedIds();
+  if (!ids.length) { toast("先勾选账号", "err"); return; }
+  try {
+    const r = await api("/api/accounts/export", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids, format: "client" }),
+    });
+    const { ok, data } = await safeJson(r);
+    if (!ok) throw new Error((data && data.detail) || ("HTTP " + r.status));
+    // 大号池走异步任务：接口返回 job_id，进度在「后台任务」里看
+    if (data.job_id) { toast("已提交导出任务，进度见「后台任务」", "ok"); return; }
+    const text = data.text || JSON.stringify(data.accounts || data, null, 2);
+    await downloadText(`miraihub-accounts-${exportStamp()}.json`, text, "application/json");
+  } catch (error) {
+    toast("导出选中失败：" + (error && error.message ? error.message : error), "err");
+  }
 }
 
 /** 给行 HTML 的 <tr> 后插入勾选列（不动各平台的行构造器）。 */
@@ -4038,8 +4229,11 @@ function accCreatedCell(a) {
 }
 
 function withPick(rowHtml, id) {
+  // `onchange` 而不是 `onclick`：键盘空格切换、程序化 `checked=` 都要算数，
+  // 否则批量操作条的计数只跟鼠标走。
   return String(rowHtml).replace(/<tr(\s[^>]*)?>/i,
-    m => `${m}<td><input type="checkbox" class="acc-pick" data-id="${id}"></td>`);
+    m => `${m}<td class="col-pick"><input type="checkbox" class="acc-pick"
+      data-id="${id}" onchange="accBulkSync()" aria-label="选择账号 #${id}"></td>`);
 }
 
 function pickAllTh() {
@@ -5032,6 +5226,10 @@ document.addEventListener("wb-platform-action", event => {
     if (action === "activity") {
       return platformActivity(spec, storage);
     }
+    // 新手任务（一次性大额积分）：Loomy 的 10000 分就靠这个领。
+    if (action === "onboarding") {
+      return platformOnboarding(spec, storage);
+    }
     if (action === "ban-recheck") {
       return platformBanRecheck(spec, storage);
     }
@@ -5986,6 +6184,97 @@ async function platformBanRecheck(spec, storage) {
   loadAccounts();
 }
 
+/**
+ * 新手任务（一次性大额积分）。
+ *
+ * Loomy 的 10000 分新手任务在客户端里是**默认 mock 后端**：界面显示
+ * 「已获得 10000 积分」也可能服务端一分没有。所以这里直接调网关接口，
+ * 由网关逐 key 调 `/onboarding/tasks/complete` 真正入账。
+ *
+ * 交互：先用 `dry_run=1` 看还有多少分没赚 → 用户确认 → 真正领取。
+ */
+async function platformOnboarding(spec, storage) {
+  const realm = (spec && spec.realm) || "";
+  const qs = realm ? `?realm=${encodeURIComponent(realm)}` : "";
+  const base = platformApiPrefix(spec, storage);
+  const label = esc((spec && spec.label) || storage);
+  const started = Date.now();
+  toast("正在读取新手任务进度…");
+  let preview;
+  try {
+    const r = await api(base + "/onboarding" + qs, { method: "GET" });
+    const { ok, data } = await safeJson(r);
+    if (!ok) throw new Error((data && data.detail) || ("HTTP " + r.status));
+    preview = data;
+  } catch (error) {
+    toast("读取任务失败：" + (error && error.message ? error.message : error), "err");
+    return;
+  }
+  const rows = preview.accounts || [];
+  const missing = rows.reduce((sum, it) => sum + (it.missing_points || 0), 0);
+  // 任务清单按客户端三段分组显示中文名：内部 key（first_message 等）
+  // 对用户没有意义，也和客户端界面上的文案对不上。
+  const catalog = preview.catalog || [];
+  const taskList = (catalog.length
+    ? catalog.map(g => `<div class="onb-group">
+        <div class="onb-group-head"><span>${esc(g.group_label)}</span>
+          <b>+${g.group_points}</b></div>
+        <div class="stat-chips">${(g.tasks || []).map(t =>
+          `<span class="stat-chip"><span>${esc(t.label || t.key)}</span><b>+${t.points}</b></span>`
+        ).join("")}</div></div>`).join("")
+    : (preview.tasks || []).map(t =>
+        `<span class="stat-chip"><span>${esc(t.label || t.key)}</span><b>+${t.points}</b></span>`
+      ).join(""));
+  const table = rows.length ? `<div class="sentinel-table-wrap" style="max-height:260px">
+    <table class="tbl"><thead><tr><th>账号</th><th class="text-right">已获得</th>
+      <th class="text-right">未领取</th><th>还差的任务</th></tr></thead><tbody>
+      ${rows.map(it => `<tr>
+        <td>${esc(it.account || ("#" + it.account_id))}</td>
+        <td class="text-right tnum">${it.earned ?? 0}</td>
+        <td class="text-right tnum" style="color:${(it.missing_points || 0) ? "var(--ok,#10b981)" : "var(--fg-subtle)"}">${it.missing_points ?? 0}</td>
+        <td class="text-xs" style="color:var(--fg-subtle)">${esc((it.pending_labels || it.pending || []).join("、") || "已全部完成")}</td>
+      </tr>`).join("")}</tbody></table></div>`
+    : `<p class="sentinel-empty">没有启用账号</p>`;
+
+  const go = await uiConfirm({
+    kind: "info",
+    title: `新手任务 · ${label}`,
+    message: `共 ${rows.length} 个账号，还有 ${missing} 积分可领（任务合计 ${preview.total_points} 分/号）。\n`
+      + "这些任务在客户端里默认只记本地账、不进服务端，网关会直接调服务端逐个领取。\n"
+      + `一次跑完约需 ${Math.max(1, Math.round(rows.length * 0.6))} 秒。现在领取？`,
+    okText: "开始领取",
+  });
+  if (!go) { closeModal(); return; }
+
+  try {
+    const r = await api(base + "/onboarding" + qs, { method: "POST" });
+    const { ok, data } = await safeJson(r);
+    if (!ok) throw new Error((data && data.detail) || ("HTTP " + r.status));
+    const gained = data.gained || 0;
+    openModal(`<h3 class="font-semibold text-lg mb-1">新手任务 · ${label}</h3>
+      <p class="text-xs mb-3" style="color:var(--fg-subtle)">
+        ${esc(data.summary || "")}</p>
+      <div class="stat-chips" style="margin:0 0 12px">
+        <span class="stat-chip"><span>本次新增</span><b>+${gained}</b></span>
+        <span class="stat-chip"><span>新完成号</span><b>${data.completed || 0}</b></span>
+        <span class="stat-chip"><span>本就完成</span><b>${data.already || 0}</b></span>
+        <span class="stat-chip${data.failed ? " is-warn" : ""}"><span>失败</span><b>${data.failed || 0}</b></span>
+      </div>
+      <p class="text-xs mb-2" style="color:var(--fg-subtle)">任务清单（每个 key 只能领一次）：</p>
+      <div class="stat-chips" style="margin-bottom:12px">${taskList}</div>
+      ${table}
+      <div class="flex justify-end mt-3 gap-2">
+        <button class="console-btn" onclick="closeModal()">关闭</button>
+        <button class="console-btn quiet" onclick="platformOnboarding(${jsv(storage)}, ${jsv(storage)})">再跑一次</button>
+      </div>`, "max-w-2xl");
+    loadAccounts();
+  } catch (error) {
+    toast("领取失败：" + (error && error.message ? error.message : error), "err");
+  } finally {
+    console.debug("[onboarding] 用时", Date.now() - started, "ms");
+  }
+}
+
 async function platformCheckin(spec, storage) {
   const realm = (spec && spec.realm) || "";
   const qs = realm ? `?realm=${encodeURIComponent(realm)}` : "";
@@ -6156,6 +6445,42 @@ async function platformExportAccounts(spec, storage) {
     </div>`, "max-w-md");
 }
 
+/**
+ * 把一段文本落成文件；**移动端走系统保存器并回报位置**。
+ *
+ * ## 为什么必须分流（2026-11-09）
+ *
+ * 桌面浏览器里 `a.download` 直接落到默认下载目录，用不着问。但 APK 是
+ * WebView：`a.download` 在大多数机型上**什么都不发生**（既不下载也不报错），
+ * 用户点完「导出」只看到一句「已导出 N 个账号」，然后哪都找不到文件。
+ *
+ * 所以移动端改走 `WBAndroid.saveText`：它会拉起系统
+ * `ACTION_CREATE_DOCUMENT` 让用户选位置，写完后端弹系统对话框告诉
+ * 「保存到 内部存储/Download/xxx.json」，并带一个「打开文件位置」按钮。
+ *
+ * @param {string} filename 建议文件名（系统保存器允许用户改）
+ * @param {string} text     文件内容
+ * @param {string} mime     MIME
+ * @returns {Promise<{path:string}>} 移动端返回保存位置；桌面端为空串
+ */
+async function saveTextToDevice(filename, text, mime) {
+  if (window.WBMobile && typeof window.WBMobile.saveText === "function"
+      && window.WBAndroid && window.WBAndroid.saveText) {
+    await window.WBMobile.saveText(filename, text, mime);
+    return { path: (window.WBAndroid.lastExportPath && window.WBAndroid.lastExportPath()) || "" };
+  }
+  const blob = new Blob([text], { type: mime || "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  return { path: "" };
+}
+
 async function platformExportDownload(base, mode, storage) {
   try {
     const r = await api(base + "/export?mode=" + encodeURIComponent(mode), {
@@ -6175,16 +6500,13 @@ async function platformExportDownload(base, mode, storage) {
       const p = n => String(n).padStart(2, "0");
       return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
     })();
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${storage || "accounts"}-${mode}-${stamp}.json`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 2000);
-    toast(`已导出 ${count} 个账号（${mode === "plain" ? "脱敏清单" : "含凭证备份"}）`, "ok");
+    const filename = `${storage || "accounts"}-${mode}-${stamp}.json`;
+    const saved = await saveTextToDevice(filename, JSON.stringify(data, null, 2),
+                                         "application/json");
+    const kind = mode === "plain" ? "脱敏清单" : "含凭证备份";
+    toast(saved.path
+      ? `已导出 ${count} 个账号（${kind}）→ ${saved.path}`
+      : `已导出 ${count} 个账号（${kind}）`, "ok");
     closeModal();
   } catch (error) {
     toast("导出异常：" + (error && error.message ? error.message : error), "err");
@@ -9107,9 +9429,16 @@ async function submitUpload(){
    单账号为官方加密 .info，批量为加密凭证集合或明文备份。
    ========================================================================== */
 
-/** 触发浏览器下载一个文本文件。 */
+/** 触发下载一个文本文件，并把「存到哪了」告诉用户。 */
 async function downloadText(filename, text, mime = "application/json") {
-  if(window.WBMobile?.saveText) return WBMobile.saveText(filename, text, mime);
+  if(window.WBMobile?.saveText) {
+    // 移动端：系统保存器选位置 → 写完由原生弹「导出完成 + 打开文件位置」。
+    await WBMobile.saveText(filename, text, mime);
+    // 原生已经弹了对话框（含路径），这里只补一条可回看的提示。
+    const path = window.WBAndroid?.lastExportPath?.() || "";
+    if (path) toast(`已保存到 ${path}`, "ok");
+    return;
+  }
   if(window.pywebview?.api?.save_text) {
     const result = await pywebview.api.save_text(filename, text, mime);
     if (!result?.ok) throw new Error(result?.cancelled ? '已取消保存' : result?.error || '文件未保存');
@@ -9267,10 +9596,24 @@ async function exportAsync() {
   });
 }
 
-/** 凭 token 触发浏览器下载导出文件（供 onFinish 自动下载等场景）。 */
-function downloadExportToken(token) {
+/** 凭 token 触发下载导出文件（供 onFinish 自动下载等场景）。 */
+async function downloadExportToken(token) {
+  const url = `/api/accounts/export-download?token=${encodeURIComponent(token)}`;
+  // APK 的 WebView 不支持 `a.download`：必须自己取回内容再走系统保存器，
+  // 否则用户点了「导出」什么都不会发生，也看不到任何错误。
+  if (window.WBMobile?.saveText) {
+    try {
+      const r = await api(url, { method: "GET" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const text = await r.text();
+      await downloadText(`miraihub-accounts-${exportStamp()}.json`, text, "application/json");
+    } catch (e) {
+      toast("导出文件下载失败：" + (e && e.message ? e.message : e), "err");
+    }
+    return;
+  }
   const a = document.createElement('a');
-  a.href = `/api/accounts/export-download?token=${encodeURIComponent(token)}`;
+  a.href = url;
   a.download = "";
   document.body.appendChild(a); a.click(); a.remove();
 }
@@ -9728,7 +10071,24 @@ function keyPlatformSelect(id, platforms, value) {
  *
  * @param {string} prefix   "k"（创建）/ "ek"（编辑）
  */
-function keyAccountPicker(prefix, accounts, selected, platform) {
+/**
+ * 账号多选面板（Key 表单用）。
+ *
+ * ## 为什么不能一次拉全量（2026-11-09 用户反馈）
+ *
+ * 聚合平台上线后一个号池动辄几千个号，`/api/accounts?all_platforms=1`
+ * 一次把**所有平台的账号**拉回来：接口几百 KB、浏览器要建几千个 DOM 节点，
+ * 打开「新建 Key」就卡两秒。列表里的搜索框还只是本地 `display` 过滤，
+ * 对没拉下来的号完全无效 —— 等于「搜不到就是不支持」。
+ *
+ * 现在的做法：
+ *   · 首屏只取第一页（`page_size=50`），脚注显示「已加载 50 / 共 N」；
+ *   · 搜索走**服务端**（`search=` 防抖 250ms），命中范围是整库；
+ *   · 已勾选的 id 存在隐藏域里，翻页/搜索都不会丢。
+ */
+const KEY_PICKER_PAGE = 50;
+
+function keyAccountPicker(prefix, accounts, selected, platform, total) {
   const picked = new Set((selected || []).map(Number));
   const rows = (accounts || []).filter(item => {
     if (!platform) return true;
@@ -9737,7 +10097,42 @@ function keyAccountPicker(prefix, accounts, selected, platform) {
   const summary = picked.size
     ? `已选 ${picked.size} 个账号 · 只用这些，不换号`
     : "不限制（使用公共账号池）";
-  const list = rows.length ? rows.map(item => {
+  const shown = total != null ? Number(total) : rows.length;
+  return `<div class="mb-2 key-picker" id="${prefix}AccountPicker">
+    <label class="text-xs text-slate-500">独占绑定账号（可选，多选）</label>
+    <div class="mt-1">
+      <button type="button" class="key-picker-trigger"
+              onclick="keyAccToggle(${jsv(prefix)})">
+        <span class="key-picker-summary${picked.size ? " has-value" : ""}"
+              id="${prefix}AccountSummary">${esc(summary)}</span>
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+             stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+      <div class="key-picker-pop" id="${prefix}AccountPop" hidden>
+        <input class="key-picker-search" id="${prefix}AccountSearch"
+               placeholder="搜索账号 / UID / 平台（服务端检索）" autocomplete="off"
+               oninput="keyAccSearch(${jsv(prefix)}, this.value)">
+        <div class="key-picker-list" id="${prefix}AccountList">${keyAccRows(prefix, rows, picked, platform)}</div>
+        <div class="key-picker-foot">
+          <span id="${prefix}AccountCount">已加载 ${rows.length} / 共 ${shown} 个</span>
+          <button type="button" class="key-picker-clear"
+                  onclick="keyAccClear(${jsv(prefix)})">清空选择</button>
+        </div>
+      </div>
+      <input type="hidden" id="${prefix}AccountIds"
+             value="${JSON.stringify([...picked])}">
+    </div>
+    <p class="text-[11px] text-slate-400 mt-1">不勾选 = 使用公共账号池；勾选后该 Key 只用这些账号，账号不可用时不换号。</p>
+  </div>`;
+}
+
+/** 渲染账号行（首屏与搜索共用）。 */
+function keyAccRows(prefix, rows, picked, platform) {
+  if (!rows.length) {
+    return `<p class="sentinel-empty" style="padding:8px 6px">${
+      platform ? "没有匹配的账号" : "没有可用账号"}</p>`;
+  }
+  return rows.map(item => {
     const on = picked.has(Number(item.id));
     const name = esc(item.name || item.uid || "账号") + " #" + item.id;
     const sub = [
@@ -9754,34 +10149,40 @@ function keyAccountPicker(prefix, accounts, selected, platform) {
         <span class="key-picker-row-sub">${sub || "—"}</span>
       </span>
     </label>`;
-  }).join("") : `<p class="sentinel-empty" style="padding:8px 6px">${
-    platform ? "该平台下没有可用账号" : "没有可用账号"}</p>`;
-  return `<div class="mb-2 key-picker" id="${prefix}AccountPicker">
-    <label class="text-xs text-slate-500">独占绑定账号（可选，多选）</label>
-    <div class="mt-1">
-      <button type="button" class="key-picker-trigger"
-              onclick="keyAccToggle(${jsv(prefix)})">
-        <span class="key-picker-summary${picked.size ? " has-value" : ""}"
-              id="${prefix}AccountSummary">${esc(summary)}</span>
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
-             stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
-      </button>
-      <div class="key-picker-pop" id="${prefix}AccountPop" hidden>
-        <input class="key-picker-search" id="${prefix}AccountSearch"
-               placeholder="搜索账号 / UID / 平台" autocomplete="off"
-               oninput="keyAccFilter(${jsv(prefix)}, this.value)">
-        <div class="key-picker-list" id="${prefix}AccountList">${list}</div>
-        <div class="key-picker-foot">
-          <span>${rows.length} 个可选账号</span>
-          <button type="button" class="key-picker-clear"
-                  onclick="keyAccClear(${jsv(prefix)})">清空选择</button>
-        </div>
-      </div>
-      <input type="hidden" id="${prefix}AccountIds"
-             value="${JSON.stringify([...picked])}">
-    </div>
-    <p class="text-[11px] text-slate-400 mt-1">不勾选 = 使用公共账号池；勾选后该 Key 只用这些账号，账号不可用时不换号。</p>
-  </div>`;
+  }).join("");
+}
+
+/** 服务端搜索（防抖）。已在列表里的行不再重建，避免闪烁。 */
+let _keyAccTimers = {};
+function keyAccSearch(prefix, term) {
+  const query = String(term || "").trim();
+  clearTimeout(_keyAccTimers[prefix]);
+  _keyAccTimers[prefix] = setTimeout(async () => {
+    const list = document.getElementById(prefix + "AccountList");
+    const counter = document.getElementById(prefix + "AccountCount");
+    if (!list) return;
+    list.innerHTML = `<p class="sentinel-empty" style="padding:8px 6px">搜索中…</p>`;
+    try {
+      const params = new URLSearchParams({
+        all_platforms: "1", page_size: String(KEY_PICKER_PAGE), page: "1",
+      });
+      if (query) params.set("search", query);
+      const r = await api("/api/accounts?" + params.toString());
+      const { ok, data } = await safeJson(r);
+      if (!ok) throw new Error((data && data.detail) || "搜索失败");
+      const items = (data.items || data.accounts || []);
+      const picked = new Set(keySelectedAccountIds(prefix));
+      list.innerHTML = keyAccRows(prefix, items, picked, "");
+      if (counter) {
+        counter.textContent = query
+          ? `「${query}」命中 ${items.length} 个`
+          : `已加载 ${items.length} / 共 ${data.total ?? items.length} 个`;
+      }
+    } catch (error) {
+      list.innerHTML = `<p class="sentinel-empty" style="padding:8px 6px">${
+        esc(error && error.message ? error.message : "搜索失败")}</p>`;
+    }
+  }, 250);
 }
 
 function keyAccToggle(prefix) {
@@ -9798,7 +10199,13 @@ function keyAccToggle(prefix) {
     // 决定向下还是向上展开。滚动/缩放时重新贴一次。
     keyAccPlace(prefix);
     const search = document.getElementById(prefix + "AccountSearch");
-    if (search) { search.value = ""; keyAccFilter(prefix, ""); search.focus(); }
+    if (search) {
+      // 打开时不发请求：首屏已经带了第一页。清空输入只是把列表还原成本地
+      // 已加载的那一页，避免一次多余的整库查询。
+      search.value = "";
+      keyAccFilter(prefix, "");
+      search.focus();
+    }
   }
 }
 
@@ -9854,10 +10261,20 @@ function keyAccFilter(prefix, term) {
   });
 }
 
+/**
+ * 勾选变化。**必须先合并隐藏域里已选的 id**：面板是分页/服务端搜索的，
+ * 当前列表可能只是结果集的一页，直接读 DOM 会把别页的勾选丢掉。
+ */
 function keyAccChange(prefix) {
-  const ids = [...document.querySelectorAll(`#${prefix}AccountList input[type="checkbox"]:checked`)]
-    .map(node => Number(node.value)).filter(value => Number.isFinite(value) && value > 0);
   const hidden = document.getElementById(prefix + "AccountIds");
+  const selected = new Set(keySelectedAccountIds(prefix));
+  document.querySelectorAll(`#${prefix}AccountList input[type="checkbox"]`)
+    .forEach(node => {
+      const value = Number(node.value);
+      if (!Number.isFinite(value) || value <= 0) return;
+      if (node.checked) selected.add(value); else selected.delete(value);
+    });
+  const ids = [...selected].sort((a, b) => a - b);
   if (hidden) hidden.value = JSON.stringify(ids);
   const summary = document.getElementById(prefix + "AccountSummary");
   if (summary) {
@@ -9871,7 +10288,13 @@ function keyAccChange(prefix) {
 function keyAccClear(prefix) {
   document.querySelectorAll(`#${prefix}AccountList input[type="checkbox"]`)
     .forEach(node => { node.checked = false; });
-  keyAccChange(prefix);
+  const hidden = document.getElementById(prefix + "AccountIds");
+  if (hidden) hidden.value = "[]";
+  const summary = document.getElementById(prefix + "AccountSummary");
+  if (summary) {
+    summary.textContent = "不限制（使用公共账号池）";
+    summary.classList.remove("has-value");
+  }
 }
 
 document.addEventListener("click", event => {
@@ -9897,10 +10320,11 @@ function keyAccountSelect(id, options, value = 0) {
     <div class="mt-1">${uiSelectHTML(id, { value: String(value || 0), options })}</div>
     <p class="text-[11px] text-slate-400 mt-1">绑定后公共池跳过该账号；此 Key 仅使用该账号的积分和模型权益，账号不可用时不会换到其他账号。停用 Key 保留绑定，解绑或删除 Key 释放账号。</p></div>`;
 }
-/** 拉平台列表 + 全平台账号（Key 表单用）。 */
+/** 拉平台列表 + 首屏一页账号（Key 表单用）。 */
 async function keyFormData() {
   let platforms = [];
   let accounts = [];
+  let total = 0;
 
   // 1) 平台列表：按 storage_platform 去重（trae-cn/trae-intl 同为 trae），
   //    保留每个 storage 的第一个 label。
@@ -9924,16 +10348,24 @@ async function keyFormData() {
     console.warn("[keyForm] 平台列表加载失败", error);
   }
 
-  // 2) 全平台账号：显式带 all_platforms=1，否则只回当前平台的
+  // 2) 账号：**只取第一页**，不再整库拉取。
+  //
+  // 聚合平台上线后一个号池几千个号，`all_platforms=1` 无分页会把所有平台
+  // 的账号一次性拉回来（几百 KB + 几千个 DOM 节点），打开「新建 Key」
+  // 就卡两秒。选择器内部改成服务端搜索 + 分页，这里只要首屏那 50 条。
   try {
-    const r = await api("/api/accounts?all_platforms=1");
+    const r = await api("/api/accounts?all_platforms=1&page_size=" + KEY_PICKER_PAGE + "&page=1");
     const { ok, data } = await safeJson(r);
-    if (ok && data && Array.isArray(data.items)) accounts = data.items;
+    if (ok && data) {
+      accounts = Array.isArray(data.items) ? data.items
+        : (Array.isArray(data.accounts) ? data.accounts : []);
+      total = Number(data.total || accounts.length);
+    }
   } catch (error) {
     console.warn("[keyForm] 账号列表加载失败", error);
   }
 
-  return { platforms, accounts };
+  return { platforms, accounts, total };
 }
 
 /** 平台切换时重渲染账号选择器。 */
@@ -9950,7 +10382,8 @@ async function onKeyPlatformChange() {
   if (!host) return;
   const state = window._keyFormState || {};
   const picked = keySelectedAccountIds(prefix);
-  host.innerHTML = keyAccountPicker(prefix, state.accounts || [], picked, platform);
+  host.innerHTML = keyAccountPicker(prefix, state.accounts || [], picked, platform,
+                                    state.total);
   window._keyFormState = { ...state, platform, picked };
 }
 
@@ -10001,7 +10434,7 @@ async function openAddKey(){
       })}</div>
       <p class="text-[11px] text-slate-400 mt-1">选择后该 Key 只能调用组内模型，调用组外模型返回 403。</p>
     </div>
-    ${keyAggregateSwitch(false)}
+    ${keyAggregateSwitch(true)}
     ${keyPlatformSelect("kPlatform", formData.platforms, "")}
     <div id="kAccountsHost">
       ${keyAccountPicker("k", formData.accounts, [], "")}
@@ -10018,7 +10451,7 @@ async function submitAddKey(){
   const rpmRaw = $("#kRatePerMinute").value;
   const body = { name:$("#kName").value||"", unlimited, credit_limit: Number($("#kLimit").value||0), note:$("#kNote").value||"", group_id: Number(uiSelectValue("kGroup")||0),
     // 新控件：聚合开关 / 独占平台 / 多选账号
-    aggregate: ($("#kAggregate")||{}).checked !== false,
+    aggregate: $("#kAggregate") ? $("#kAggregate").checked : true,
     platform: String(uiSelectValue("kPlatform") || "").toLowerCase(),
     account_ids: keySelectedAccountIds("k"),
     max_concurrent: mcRaw === "" ? null : Number(mcRaw), rate_per_minute: rpmRaw === "" ? null : Number(rpmRaw) };
@@ -12844,6 +13277,28 @@ const TASK_LABELS = {
   run_growth_tasks: "自动做成长任务",
   run_growth_plan: "WorkBuddy 成长计划巡检",
   keepalive_tokens: "token 保活刷新",
+  ban_recheck: "风控封号复核与自动解封",
+  daily_activity: "每日活跃对话",
+  // ---- 各平台任务（原来这些一律回退成英文 task 名）----
+  loomy_onboarding: "新手任务领积分",
+  loomy_checkin: "每日签到",
+  loomy_keepalive: "会话保活",
+  trae_checkin: "每日签到",
+  trae_keepalive: "会话保活",
+  refresh_quota: "刷新额度",
+  qoder_checkin: "每日签到",
+  qoder_keepalive: "会话保活",
+  codearts_checkin: "每日签到",
+  codearts_keepalive: "会话保活",
+  raccoon_keepalive: "会话保活",
+  raccoon_expiry_sweep: "过期账号清理",
+  minimax_checkin: "每日签到",
+  minimax_keepalive: "会话保活",
+  minimax_refresh_quota: "刷新额度",
+  wps_lingxi_checkin: "每日签到",
+  wps_lingxi_keepalive: "会话保活",
+  wps_lingxi_activity: "每日活跃对话",
+  wps_lingxi_ban_recheck: "失效账号复检",
 };
 
 function scheduleResultSummary(s){
@@ -13964,26 +14419,64 @@ function initLogSelects() {
 let _logPlatformLoaded = false;
 //: 落库平台名 -> 展示名（筛选提示与表格徽标共用）
 let _logPlatformLabels = {};
-async function fillLogPlatformOptions(force) {
-  if (_logPlatformLoaded && !force) return;
-  let items = [];
+
+/**
+ * 「按平台筛选」的选项，两处共用（使用记录 / 用量统计）。
+ *
+ * ## 为什么有两级来源（2026-11-09 用户反馈「按平台只有全部、选不了别的」）
+ *
+ * 原来只读 `/api/platforms`，而且 `if (!items.length) return;` ——
+ * 一旦这个接口失败（或插件没装配好、返回空数组），下拉就**永远停在**
+ * 一项「全部平台」，用户完全没法按平台查使用统计，也看不出是加载失败。
+ *
+ * 现在：
+ *   1. 首选 `/api/platforms`（有展示名、有顺序）；
+ *   2. 拿不到就退回 `/api/stats/usage/options` 里**真实出现过**的平台
+ *      （必定非空，因为那条统计本身就是从 usage_logs 聚合出来的）；
+ *   3. 两级都空 → 至少把「全部平台」留下，并在控制台 warn 一句。
+ */
+async function platformFilterOptions() {
+  const options = [{ value: "", label: "全部平台" }];
+  const seen = new Set();
+  const push = (value, label) => {
+    const key = String(value || "").toLowerCase();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    options.push({ value: key, label: label || key });
+    _logPlatformLabels[key] = label || key;
+  };
+  // 1) 平台注册表
   try {
     const r = await api("/api/platforms");
     const { ok, data } = await safeJson(r);
-    if (ok && data && Array.isArray(data.items)) items = data.items;
-  } catch (e) { return; }
-  if (!items.length) return;
+    if (ok && data && Array.isArray(data.items)) {
+      data.items.forEach(item => {
+        push(item.storage_platform || item.id, item.label || "");
+      });
+    }
+  } catch (e) { /* 走下一级兜底 */ }
+  // 2) 窗口内真的出现过的平台（也是筛选项的「有数据」提示）
+  if (options.length === 1) {
+    try {
+      const blank = new URLSearchParams();
+      const r = await api("/api/stats/usage/options?" + blank.toString());
+      const { ok, data } = await safeJson(r);
+      if (ok && data && Array.isArray(data.platforms)) {
+        data.platforms.forEach(item => push(item.value, item.label));
+      }
+    } catch (e) { /* 两级都失败就只留「全部平台」 */ }
+  }
+  if (options.length === 1) {
+    console.warn("[platform-filter] 平台清单为空，按平台筛选只能显示「全部平台」");
+  }
+  return options;
+}
+
+async function fillLogPlatformOptions(force) {
+  if (_logPlatformLoaded && !force) return;
+  const options = await platformFilterOptions();
+  if (options.length <= 1) return;
   _logPlatformLoaded = true;
-  // 同一个 storage 平台只留一项（trae-cn/trae-intl 存的是同一个 trae）
-  const seen = new Set();
-  const options = [{ value: "", label: "全部平台" }];
-  items.forEach(item => {
-    const storage = String(item.storage_platform || item.id || "").toLowerCase();
-    if (!storage || seen.has(storage)) return;
-    seen.add(storage);
-    options.push({ value: storage, label: item.label || storage });
-    _logPlatformLabels[storage] = item.label || storage;
-  });
   const cur = uiSelectValue("logPlatformSel") || "";
   const box = $("#logPlatformSel");
   if (box) box.outerHTML = uiSelectHTML("logPlatformSel", {
@@ -14179,7 +14672,13 @@ async function loadLogs(page, silent = false) {
   const stats = d.stats;
   if (revision === _logUsageRevision) _logUsageDirty = false;
   _logUsageAt = Date.now();
-  $('#logStats').textContent = stats ? `当前筛选 · 共 ${stats.total} 次 · 成功 ${stats.success} 次 · 错误 ${stats.error} 次` : silent ? '用量记录已实时更新 · 总数统计请点击查询' : '快速翻页未统计总数';
+  $('#logStats').innerHTML = stats
+    ? logStatChips([
+        { label: "共", value: stats.total, tone: "" },
+        { label: "成功", value: stats.success, tone: "is-ok" },
+        { label: "错误", value: stats.error, tone: stats.error ? "is-bad" : "" },
+      ])
+    : `<span class="logstat-plain">${silent ? "用量记录已实时更新 · 总数统计请点击查询" : "快速翻页未统计总数"}</span>`;
   if (_logPage === 1 && !silent) { loadLogSummary(); }
 
   const total = d.total;              // null = 本次未统计
@@ -15043,9 +15542,24 @@ function initUsageSelects() {
   const platformBox = $("#usagePlatformSel");
   if (platformBox) platformBox.outerHTML = uiSelectHTML("usagePlatformSel", {
     value: "",
+    // 先给「全部平台」+ 占位：真正的平台清单由 loadUsageFilterOptions
+    // 按窗口内出现过的平台填充。这里如果只写死一项，一旦后面的填充失败，
+    // 用户看到的就是「按平台只有全部、选不了别的」。
     options: [{ value: "", label: "全部平台（全网关）" }],
     onChange: () => loadUsageStats(),
   });
+  // 不论统计接口是否返回 platforms，先把注册表里的平台灌进去兜底。
+  platformFilterOptions().then(options => {
+    const box = $("#usagePlatformSel");
+    if (!box || options.length <= 1) return;
+    if (_uiSelectMap.get("usagePlatformSel")?.options?.length > 1) return;
+    box.outerHTML = uiSelectHTML("usagePlatformSel", {
+      value: "",
+      options: [{ value: "", label: "全部平台（全网关）" }].concat(
+        options.filter(o => o.value)),
+      onChange: () => loadUsageStats(),
+    });
+  }).catch(() => {});
   const daysBox = $("#usageDaysSel");
   if (daysBox) daysBox.outerHTML = uiSelectHTML("usageDaysSel", {
     // 默认今日（自然日）+ 按小时：最常见的诉求是「今天怎么样」，

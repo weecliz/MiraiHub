@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -103,6 +104,40 @@ class ImportLocalIn(BaseModel):
     """
 
     uids: list[str] | None = None
+
+
+@router.get("/export")
+def export(realm: str = "", mode: str = "", reveal: int = 0,
+           _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """导出号池（issue #25：Loomy 之前只有导入、没有导出）。
+
+    ## 两档，口径与控制台通用导出按钮一致
+
+    `mode=plain`（默认）→ **脱敏清单**：uid / 手机号打码 / 余额 / 到期时间，
+    可以直接发给别人做台账，不含任何能登录的东西。
+    `mode=backup`       → **完整凭证**（含 session token），只能自己留档。
+
+    `reveal=1` 是老参数，等同 `mode=backup`。
+
+    返回体同时给 `accounts` 数组（通用导出按钮读它）和 `text`（JSONL，
+    与 `/import-batch` 严格对称）—— 导出的文件可以直接喂回导入，
+    实现「换机器搬号池」。
+    """
+    from admin.platform.loomy.services import accounts as loomy_accounts
+
+    full = bool(reveal) or str(mode or "").strip().lower() == "backup"
+    rows = loomy_accounts.accounts_for(db, _realm_or_400(realm))
+    records: list[dict] = []
+    for account in rows:
+        record = loomy_accounts.export_record(account, reveal=full)
+        if record:
+            records.append(record)
+    return {"realm": realm, "count": len(records), "mode": "backup" if full else "plain",
+            "reveal": full, "format": "jsonl",
+            "accounts": records,
+            "text": "\n".join(json.dumps(item, ensure_ascii=False) for item in records),
+            "note": ("完整凭证含登录态，请私密保存"
+                     if full else "已脱敏：不含 session token，不能直接导入同一账号")}
 
 
 @router.post("/import-local")
@@ -491,3 +526,44 @@ def checkin(realm: str = "", _: bool = Depends(require_admin),
     """Loomy 没有签到 —— 返回 `supported: False`（不是错误）。"""
     return {"supported": False,
             "summary": "Loomy 没有签到接口；额度按对话计量"}
+
+
+@router.get("/onboarding")
+def onboarding_status(realm: str = "", _: bool = Depends(require_admin),
+                      db: Session = Depends(get_db)):
+    """新手任务进度（8 个一次性任务，共 10000 积分）。
+
+    读的是**服务端**状态，不是客户端本地 json —— 客户端默认 mock 后端，
+    界面上"已获得 N 积分"完全可能服务端一分都没有。
+    """
+    from admin.platform.loomy.services import onboarding as onboarding_svc
+
+    rows = onboarding_svc.status_of_each(db, _realm_or_400(realm))
+    return {
+        "supported": True,
+        "total_points": onboarding_svc.total_points(),
+        # 中文任务清单（按客户端三段分组）：key 只用于提交，展示用 label
+        "catalog": onboarding_svc.task_catalog(),
+        "tasks": [{"key": k, "label": onboarding_svc.label_of(k), "points": v}
+                  for k, v in onboarding_svc.point_table().items()],
+        "accounts": rows,
+        "summary": "共 %d 个账号，仍有 %d 积分未领取"
+                   % (len(rows), sum(max(0, r.get("missing_points") or 0)
+                                     for r in rows)),
+    }
+
+
+@router.post("/onboarding")
+def onboarding_run(realm: str = "", dry_run: int = 0,
+                   limit: int | None = None,
+                   _: bool = Depends(require_admin),
+                   db: Session = Depends(get_db)):
+    """把所有启用账号的新手任务补齐（幂等，可反复点）。
+
+    `dry_run=1` 只统计不领取 —— 用来先看「还有多少分没赚」。
+    一次跑 8 个 key × N 个号，串行 + 抖动，几十个号需要一两分钟。
+    """
+    from admin.platform.loomy.services import onboarding as onboarding_svc
+
+    return onboarding_svc.run_all(db, _realm_or_400(realm),
+                                  limit=limit, dry_run=bool(dry_run))
